@@ -2,18 +2,20 @@
 Training script with hardware-optimized configurations.
 """
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
 import os
 import json
 import cv2
 import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import GradScaler, autocast
 from torchvision import transforms
 from PIL import Image
-from torch.cuda.amp import GradScaler, autocast
 from model import create_synthesizer_model
+import warnings
+warnings.filterwarnings('ignore')
 
 class SimpleDataset(Dataset):
     def __init__(self, frame_root, annotation_file, max_samples=1000):
@@ -24,7 +26,7 @@ class SimpleDataset(Dataset):
         available_videos = set(os.listdir(frame_root))
         self.annotations = [s for s in all_annotations if s['id'] in available_videos][:max_samples]
         
-        with open('annotations/something-something-v2-labels.json', 'r') as f:
+        with open('/something-something-v2-labels.json', 'r') as f:
             labels = json.load(f)
             # Create proper class_to_idx mapping (convert string indices to int)
             self.class_to_idx = {k: int(v) for k, v in labels.items()}
@@ -49,19 +51,35 @@ class SimpleDataset(Dataset):
         if isinstance(class_idx, str):
             class_idx = 0  # Default to class 0 if mapping fails
         
-        # Load frames
+        # Load context frames (full frames)
         frame_dir = os.path.join(self.frame_root, video_id)
         frame_files = sorted([f for f in os.listdir(frame_dir) if f.endswith('.jpg')])[:30]
         
-        frames = []
+        context_frames = []
         for f in frame_files:
             try:
                 img = cv2.imread(os.path.join(frame_dir, f))
                 img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 img = Image.fromarray(img)
-                frames.append(self.transform(img))
+                context_frames.append(self.transform(img))
             except:
                 continue
+        
+        # Load YOLO-extracted object crops
+        object_crops_dir = os.path.join(frame_dir, 'object_crops')
+        object_crops = []
+        
+        if os.path.exists(object_crops_dir):
+            # Load object crops extracted by YOLO preprocessing
+            crop_files = sorted([f for f in os.listdir(object_crops_dir) if f.endswith('.jpg')])[:30]
+            for f in crop_files:
+                try:
+                    img = cv2.imread(os.path.join(object_crops_dir, f))
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    img = Image.fromarray(img)
+                    object_crops.append(self.transform(img))
+                except:
+                    continue
         
         # Pad to sequence length with proper normalized zeros
         zero_frame = torch.zeros(3, 112, 112)
@@ -70,19 +88,56 @@ class SimpleDataset(Dataset):
         zero_frame[1] = (0 - 0.456) / 0.224  # G channel  
         zero_frame[2] = (0 - 0.406) / 0.225  # B channel
         
-        while len(frames) < 30:
-            frames.append(zero_frame)
-        frames = frames[:30]
+        # Pad context frames
+        while len(context_frames) < 30:
+            context_frames.append(zero_frame)
+        context_frames = context_frames[:30]
         
-        # Dummy data for other modalities - normalized to prevent NaN
-        hand_landmarks = torch.randn(30, 21, 2) * 0.1  # Smaller variance
-        hand_landmarks = torch.clamp(hand_landmarks, -1, 1)  # Clamp to prevent extremes
-        object_crops = torch.stack(frames)  # Use same as context for now
+        # Pad object crops (fallback to context frames if no crops available)
+        if len(object_crops) == 0:
+            print(f"⚠️  No object crops found for {video_id}, using context frames")
+            object_crops = context_frames.copy()
+        else:
+            while len(object_crops) < 30:
+                object_crops.append(zero_frame)
+            object_crops = object_crops[:30]
+        
+        # Load real hand landmarks (detected by MediaPipe during preprocessing)
+        hand_landmarks_dir = os.path.join(frame_dir, 'hand_landmarks')
+        hand_landmarks_sequence = []
+        
+        if os.path.exists(hand_landmarks_dir):
+            # Load MediaPipe-detected landmarks
+            landmark_files = sorted([f for f in os.listdir(hand_landmarks_dir) if f.endswith('.npy')])[:30]
+            for f in landmark_files:
+                try:
+                    landmarks = np.load(os.path.join(hand_landmarks_dir, f))
+                    # Normalize landmarks to [-1, 1] range based on image size
+                    landmarks_norm = landmarks.copy().astype(np.float32)
+                    landmarks_norm[:, 0] /= 112  # Normalize x by width
+                    landmarks_norm[:, 1] /= 112  # Normalize y by height  
+                    landmarks_norm = (landmarks_norm - 0.5) * 2  # Map [0,1] -> [-1,1]
+                    hand_landmarks_sequence.append(torch.from_numpy(landmarks_norm))
+                except:
+                    continue
+        
+        # Pad hand landmarks sequence
+        if len(hand_landmarks_sequence) == 0:
+            # Fallback to dummy landmarks if no real ones available
+            print(f"⚠️  No hand landmarks found for {video_id}, using dummy data")
+            hand_landmarks_sequence = [torch.randn(21, 2) * 0.1 for _ in range(30)]
+        else:
+            # Pad with zeros if sequence too short
+            while len(hand_landmarks_sequence) < 30:
+                hand_landmarks_sequence.append(torch.zeros(21, 2))
+        
+        hand_landmarks_sequence = hand_landmarks_sequence[:30]
+        hand_landmarks = torch.stack(hand_landmarks_sequence)
         
         return {
             'hand_landmarks': hand_landmarks,
-            'object_crops': object_crops,
-            'context_frames': torch.stack(frames),
+            'object_crops': torch.stack(object_crops),
+            'context_frames': torch.stack(context_frames),
             'label': torch.tensor(class_idx, dtype=torch.long)
         }
 

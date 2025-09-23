@@ -5,55 +5,122 @@ Multi-Stream Cross-Attention Synthesizer for Something-Something-v2 Action Recog
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.models as models
+from torchvision import models
+try:
+    from torch_geometric.nn import GCNConv, global_mean_pool
+    from torch_geometric.data import Data
+    TORCH_GEOMETRIC_AVAILABLE = True
+except ImportError:
+    TORCH_GEOMETRIC_AVAILABLE = False
+    print("⚠️  torch_geometric not available. Using MLP for hand encoder.")
+
 import math
 
 # We'll build this incrementally due to space constraints
 
 class HandGNNEncoder(nn.Module):
-    """Simplified Hand encoder using MLP for hand landmarks."""
+    """
+    Graph Neural Network encoder for hand landmarks that understands 
+    the hand's skeletal structure and kinematic relationships.
+    """
     
     def __init__(self, embedding_dim=128):
         super(HandGNNEncoder, self).__init__()
         self.embedding_dim = embedding_dim
         
-        # Simple MLP for 21 landmarks * 2 coordinates = 42 features
-        self.encoder = nn.Sequential(
-            nn.Linear(42, 128),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(128, 256),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(256, embedding_dim)
-        )
+        # if TORCH_GEOMETRIC_AVAILABLE:
+            # GNN layers: 2D coordinates -> 64 -> embedding_dim
+        self.conv1 = GCNConv(2, 64)
+        self.conv2 = GCNConv(64, embedding_dim)
+        
+        # Define hand skeleton structure (MediaPipe 21-landmark hand model)
+        # This encodes the physical structure of a human hand
+        self.register_buffer('edge_index', torch.tensor([
+            # Thumb (landmarks 0-4)
+            [0, 1], [1, 2], [2, 3], [3, 4],
+            # Index finger (landmarks 0, 5-8)  
+            [0, 5], [5, 6], [6, 7], [7, 8],
+            # Middle finger (landmarks 0, 9-12)
+            [0, 9], [9, 10], [10, 11], [11, 12],
+            # Ring finger (landmarks 0, 13-16)
+            [0, 13], [13, 14], [14, 15], [15, 16],
+            # Pinky finger (landmarks 0, 17-20)
+            [0, 17], [17, 18], [18, 19], [19, 20],
+            # Palm connections (optional but helpful for stability)
+            [5, 9], [9, 13], [13, 17]
+        ], dtype=torch.long).t().contiguous())
+        
+        print("✅ Using GNN-based hand encoder with skeletal structure")
+        # else:
+        #     # Fallback to MLP if torch_geometric not available
+        #     self.mlp_encoder = nn.Sequential(
+        #         nn.Linear(42, 128),  # 21 landmarks * 2 coords = 42
+        #         nn.ReLU(),
+        #         nn.Dropout(0.1),
+        #         nn.Linear(128, 256),
+        #         nn.ReLU(),
+        #         nn.Dropout(0.1),
+        #         nn.Linear(256, embedding_dim)
+        #     )
+        #     print("⚠️  Using MLP fallback for hand encoder")
         
     def forward(self, hand_landmarks):
-        # hand_landmarks: [batch_size, seq_len, 21, 2] or [batch_size, 21, 2]
-        original_shape = hand_landmarks.shape
+        # hand_landmarks: [batch_size, seq_len, 21, 2]
+        if not TORCH_GEOMETRIC_AVAILABLE:
+            # Fallback to MLP
+            original_shape = hand_landmarks.shape
+            if len(original_shape) == 4:  # Sequence input
+                batch_size, seq_len = original_shape[:2]
+                hand_landmarks = hand_landmarks.view(batch_size, seq_len, -1)
+                return self.mlp_encoder(hand_landmarks)
+            else:  # Single frame
+                hand_landmarks = hand_landmarks.view(hand_landmarks.shape[0], -1)
+                return self.mlp_encoder(hand_landmarks)
         
-        if len(original_shape) == 4:  # Sequence input
-            batch_size, seq_len = original_shape[:2]
-            hand_landmarks = hand_landmarks.view(batch_size, seq_len, -1)  # [batch_size, seq_len, 42]
-            embeddings = self.encoder(hand_landmarks)  # [batch_size, seq_len, embedding_dim]
-        else:  # Single frame
-            hand_landmarks = hand_landmarks.view(hand_landmarks.shape[0], -1)  # [batch_size, 42]
-            embeddings = self.encoder(hand_landmarks)  # [batch_size, embedding_dim]
-            
-        return embeddings
+        # GNN-based encoding
+        batch_size, seq_len = hand_landmarks.shape[:2]
+        
+        # Reshape for GNN processing: [B, S, 21, 2] -> [B*S, 21, 2]
+        node_features = hand_landmarks.view(-1, 21, 2)
+        
+        # Create batch vector for torch_geometric
+        # Tells which nodes belong to which graph in the batch
+        batch_vector = torch.arange(
+            batch_size * seq_len, 
+            device=hand_landmarks.device
+        ).repeat_interleave(21)
+        
+        # GNN message passing
+        # Each landmark updates its features based on connected landmarks
+        x = node_features.view(-1, 2)  # [B*S*21, 2]
+        x = F.relu(self.conv1(x, self.edge_index))  # [B*S*21, 64]
+        x = self.conv2(x, self.edge_index)  # [B*S*21, embedding_dim]
+        
+        # Graph pooling: aggregate 21 landmark embeddings -> single hand embedding
+        graph_embeddings = global_mean_pool(x, batch_vector)  # [B*S, embedding_dim]
+        
+        # Reshape back to sequence format: [B*S, embedding_dim] -> [B, S, embedding_dim]
+        output = graph_embeddings.view(batch_size, seq_len, self.embedding_dim)
+        
+        return output
 
 class ObjectCNNEncoder(nn.Module):
-    """CNN encoder for object appearance using MobileNetV2."""
+    """
+    CNN encoder for object appearance using a pre-trained MobileNetV2.
+    It takes a sequence of pre-cropped object images as input.
+    """
     
     def __init__(self, embedding_dim=256, pretrained=True):
         super(ObjectCNNEncoder, self).__init__()
         self.embedding_dim = embedding_dim
         
-        # Load pre-trained MobileNetV2
+        # 1. Load a pre-trained MobileNetV2 as the feature extraction backbone
         self.backbone = models.mobilenet_v2(pretrained=pretrained)
+        
+        # 2. Remove the final classification layer to get raw features (output size: 1280)
         self.backbone.classifier = nn.Identity()
         
-        # Projection head
+        # 3. Create a "projection head" to map the raw features to our desired embedding size
         self.projection = nn.Sequential(
             nn.Linear(1280, embedding_dim * 2),
             nn.ReLU(),
@@ -62,22 +129,23 @@ class ObjectCNNEncoder(nn.Module):
         )   
         
     def forward(self, object_crops):
+        # Input shape: [batch_size, seq_len, 3, H, W]
         original_shape = object_crops.shape
+        batch_size, seq_len = original_shape[:2]
         
-        if len(original_shape) == 5:  # [batch_size, seq_len, 3, H, W]
-            batch_size, seq_len = original_shape[:2]
-            object_crops = object_crops.view(-1, *original_shape[2:])
-        else:
-            batch_size = original_shape[0]
-            seq_len = 1
+        # Merge batch and sequence dims to process all crops at once: [B*S, C, H, W]
+        object_crops_flat = object_crops.view(-1, *original_shape[2:])
         
-        features = self.backbone(object_crops)
+        # Get features from the backbone: [B*S, 1280]
+        features = self.backbone(object_crops_flat)
+        
+        # Project features to our final embedding dimension: [B*S, embedding_dim]
         embeddings = self.projection(features)
         
-        if len(original_shape) == 5:
-            embeddings = embeddings.view(batch_size, seq_len, self.embedding_dim)
+        # Reshape the output back to a sequence: [B, S, embedding_dim]
+        output_embeddings = embeddings.view(batch_size, seq_len, self.embedding_dim)
         
-        return embeddings
+        return output_embeddings
 
 class ContextCNNEncoder(nn.Module):
     """CNN encoder for scene context using ResNet34."""

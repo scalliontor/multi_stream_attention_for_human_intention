@@ -3,16 +3,38 @@
 Video action recognition for Something-Something-v2 dataset.
 
 ## 🏗️ Architecture
-1. **Hand landmarks** → HandGNNEncoder (128D)
-2. **Object crops** → MobileNetV2 (256D)  
+1. **Hand landmarks** → **MediaPipe + GNN** HandGNNEncoder (128D) - *real hand detection*
+2. **Object crops** → **YOLO + MobileNetV2** (256D) - *detects manipulated objects*
 3. **Full frames** → ResNet34 (512D)
 4. **Cross-attention fusion** → BiLSTM → 174 classes
+
+### 🔬 **GNN Hand Encoder**
+- **Real Hand Detection**: MediaPipe detects 21 hand landmarks per frame
+- **Structural Knowledge**: Encodes the hand skeleton structure with GNN
+- **Message Passing**: Each landmark learns from its connected neighbors (thumb tip ↔ thumb knuckle)
+- **Better Generalization**: Understands physical hand constraints
+- **Fallback**: Automatically uses MLP if `torch_geometric` not available
+
+### 🎯 **Clip-Level Heuristic Object Detection**
+- **3-Phase Processing**: Analyze entire video → Find target object → Generate consistent crops
+- **Temporal Consistency**: Tracks the SAME primary object throughout entire video
+- **Peak Interaction Detection**: Finds moment of maximum hand-object IoU across all frames
+- **MediaPipe Integration**: Uses real hand landmarks to create hand bounding box
+- **YOLOv11n Detection**: Detects all objects, selects best hand-object interaction
+- **Robust Fallbacks**: Object tracking → center crop → dummy data as needed
+
+### 🔬 **Why Clip-Level Heuristic?**
+- **Problem**: Something-Something-v2 has NO bounding box annotations
+- **Solution**: Automatically detect the primary manipulated object per video
+- **Advantage**: Temporally consistent object crops (not random per-frame crops)
+- **Result**: Model learns focused object representations for each action
 
 ## 📁 Core Files
 - `model.py` - Complete architecture (30M parameters)
 - `train.py` - Training with manual parameters
+- `test.py` - **Comprehensive test evaluation pipeline**
 - `inference.py` - Inference with visualization
-- `preprocess.py` - Video preprocessing
+- `preprocess.py` - **Clip-level heuristic preprocessing**
 - `run_preprocessing.py` - Preprocessing runner
 
 ## 🚀 Quick Start
@@ -23,12 +45,39 @@ pip install -r requirements.txt
 pip install matplotlib  # For visualization
 ```
 
-### 2. Train Model
+**For GNN Hand Encoder** (recommended):
+```bash
+pip install torch-geometric
+```
+
+**For YOLO Object Detection** (recommended):
+```bash
+pip install ultralytics
+```
+
+**For MediaPipe Hand Detection** (recommended):
+```bash
+pip install mediapipe
+```
+*Note: All have automatic fallbacks if not installed*
+
+### 2. Preprocess with Clip-Level Heuristic
+```bash
+python run_preprocessing.py --mode both --threads 16
+# Creates: frames + object_crops + hand_landmarks for each video
+```
+
+### 3. Train Model
 ```bash
 python train.py
 ```
 
-### 3. Inference
+### 4. Test Model
+```bash
+python test.py  # Comprehensive evaluation on test set
+```
+
+### 5. Inference
 ```bash
 python inference.py                # Standard metrics
 python inference.py --visualize    # With visualization

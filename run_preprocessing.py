@@ -19,13 +19,21 @@ def main():
                        help='Show what would be done without actually doing it')
     parser.add_argument('--subset', type=int, default=None,
                        help='Process only first N videos (for testing)')
+    # Optional overrides for paths (useful on a new computer)
+    parser.add_argument('--video_root', type=str, default=None,
+                       help='Path to original videos (.webm)')
+    parser.add_argument('--frame_root', type=str, default=None,
+                       help='Path to save extracted frames')
+    parser.add_argument('--anno_root', type=str, default=None,
+                       help='Path to annotations directory')
     
     args = parser.parse_args()
     
-    current_dir = '/mnt/DA0054DE0054C365/linh_tinh/Share_tech/hand/multi_stream_attention'
-    video_root = os.path.join(current_dir, '20bn-something-something-v2')
-    frame_root = os.path.join(current_dir, '20bn-something-something-v2-frames')
-    anno_root = os.path.join(current_dir, 'annotations')
+    # Default to project root (directory of this file) for portability
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    video_root = args.video_root or os.path.join(project_root, '20bn-something-something-v2')
+    frame_root = args.frame_root or os.path.join(project_root, '20bn-something-something-v2-frames')
+    anno_root = args.anno_root or os.path.join(project_root, 'annotations')
     
     print("🎬 Something-Something-v2 Dataset Preprocessing")
     print("=" * 50)
@@ -87,11 +95,20 @@ def main():
     # Run preprocessing
     if args.mode in ['frames', 'both']:
         print("\n📹 Processing video frames...")
-        cmd = f"python somethingsomethingv2.py --num_threads {args.threads}"
+        # Build command to call preprocess.py with forwarded arguments
+        cmd_parts = [
+            "python", "preprocess.py",
+            f"--num_threads {args.threads}",
+            f"--video_root '{video_root}'",
+            f"--frame_root '{frame_root}'",
+            f"--anno_root '{anno_root}'",
+            "--decode_video",
+            "--build_file_list"
+        ]
+        # Note: subset is supported directly in preprocess.py in this repo version if provided; if not, full run.
         if args.subset:
-            # For subset, we'd need to modify the main script, but for now just run normally
-            pass
-        
+            cmd_parts.append(f"--subset {args.subset}")
+        cmd = " ".join(cmd_parts)
         print(f"Running: {cmd}")
         result = os.system(cmd)
         
