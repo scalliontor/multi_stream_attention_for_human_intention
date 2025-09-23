@@ -65,3 +65,127 @@ USE_MIXED_PRECISION = True  # Saves memory
 ## 📊 Status
 - **Processed Videos**: 63,810/220,847 (28.9%)
 - **Ready for training**: ✅
+
+## 🖥️ Processing on a New Computer
+
+Follow these steps to prepare the dataset on a fresh machine.
+
+### 1) Install system dependencies
+- Ubuntu/Debian:
+```bash
+sudo apt-get update && sudo apt-get install -y ffmpeg
+```
+- Verify ffmpeg:
+```bash
+ffmpeg -version
+```
+
+### 2) Prepare directories
+- Place the dataset videos (Something-Something-v2 .webm files) under a folder, e.g.:
+  - `/data/ssv2/videos` (contains many `.webm` files)
+- Ensure annotations JSONs are available under a folder, e.g.:
+  - `/data/ssv2/annotations` (contains `something-something-v2-*.json` and `something-something-v2-labels.json`)
+- Choose an output folder for extracted frames, e.g.:
+  - `/data/ssv2/frames`
+
+If you keep the default project layout, you can just drop them into:
+- `20bn-something-something-v2/` (videos)
+- `annotations/` (annotation JSONs)
+- `20bn-something-something-v2-frames/` will be created automatically
+
+If your labels are in the downloaded folder `20bn-something-something-download-package-labels/`, either rename it to `annotations/` or create a symlink:
+
+```bash
+ln -s 20bn-something-something-download-package-labels annotations
+```
+
+This lets training/inference find JSONs at `annotations/something-something-v2-*.json`.
+
+### 3) Run preprocessing (local project folder)
+
+Run these from the repository root (this folder):
+
+- Dry run (prints plan only):
+```bash
+python run_preprocessing.py --mode both --dry-run
+```
+
+- Process frames + build file lists (labels under local `annotations/`):
+```bash
+python run_preprocessing.py --mode both --threads 16
+```
+
+- If your labels are under `20bn-something-something-download-package-labels/` and you do NOT want a symlink:
+```bash
+python run_preprocessing.py --mode both --threads 16 \
+  --anno_root ./20bn-something-something-download-package-labels
+```
+
+- Process only frames (no annotation rewrite):
+```bash
+python run_preprocessing.py --mode frames --threads 16
+```
+
+- Build annotation file lists only (after frames exist):
+```bash
+python run_preprocessing.py --mode annotations
+```
+
+### 3b) Run preprocessing (portable, with custom absolute paths)
+- Dry run (prints plan only):
+```bash
+python run_preprocessing.py --mode both --dry-run \
+  --video_root /data/ssv2/videos \
+  --frame_root /data/ssv2/frames \
+  --anno_root /data/ssv2/annotations
+```
+
+- Process frames + build file lists (custom paths):
+```bash
+python run_preprocessing.py --mode both --threads 16 \
+  --video_root /data/ssv2/videos \
+  --frame_root /data/ssv2/frames \
+  --anno_root /data/ssv2/annotations
+```
+
+- Process only frames (no annotation rewrite):
+```bash
+python run_preprocessing.py --mode frames --threads 16 \
+  --video_root /data/ssv2/videos \
+  --frame_root /data/ssv2/frames
+```
+
+- Build annotation file lists only (after frames exist):
+```bash
+python run_preprocessing.py --mode annotations \
+  --anno_root /data/ssv2/annotations \
+  --frame_root /data/ssv2/frames
+```
+
+- Process a small subset (sanity check):
+```bash
+python run_preprocessing.py --mode both --threads 8 --subset 100 \
+  --video_root /data/ssv2/videos \
+  --frame_root /data/ssv2/frames \
+  --anno_root /data/ssv2/annotations
+```
+
+### 4) Notes and tips
+- Resumable: the pipeline skips videos that already have extracted frames.
+- Threads: set `--threads` based on CPU cores and disk speed (8–32 is typical).
+- Disk space: frames take significant space. Expect 150–250 GB for full SSV2.
+- Time estimate: shown before start; actual speed depends on CPU/SSD.
+- Portability: both `run_preprocessing.py` and `preprocess.py` accept custom paths and default to the project folder if not provided.
+
+### 5) After preprocessing
+- Training will look for frames and annotations in the locations you set.
+- If you used custom paths, either keep them the same or move/link them to:
+  - `20bn-something-something-v2-frames/`
+  - `annotations/`
+
+### 6) Full processing recommendations
+- Use SSD/NVMe for `--frame_root` to maximize throughput.
+- Use 16–32 threads on a modern 8–16 core CPU.
+- Run overnight; the job can be stopped and resumed.
+- Keep terminal session persistent (tmux/screen) when running long jobs.
+
