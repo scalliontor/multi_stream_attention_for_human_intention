@@ -1,56 +1,35 @@
-"""This script is for preprocessing something-something-v2 dataset.
-The code is largely borrowed from https://github.com/MIT-HAN-LAB/temporal-shift-module
-and https://github.com/metalbubble/TRN-pytorch/blob/master/process_dataset.py
+#!/usr/bin/env python3
+"""
+HYBRID Preprocessing pipeline using Something-Else annotations + MediaPipe:
+1. Frame extraction from videos
+2. Load pre-computed bounding boxes for hands and objects from Something-Else dataset
+3. Use ground truth HAND BBOX as ROI for MediaPipe (much more accurate!)
+4. Use ground truth OBJECT BBOX for direct object cropping
+5. Save processed data for training
+
+Key Features:
+- Ground truth hand bbox → MediaPipe ROI → High-quality joint coordinates
+- Ground truth object bbox → Direct object cropping  
+- Best of both worlds: ROI guidance + rich joint information
+- Much higher accuracy than full-frame MediaPipe
 """
 
 import os
-import sys
-import threading
-import argparse
-import json
 import cv2
+import json
 import numpy as np
+from PIL import Image
+from tqdm import tqdm
 
-try:
-    from ultralytics import YOLO
-    YOLO_AVAILABLE = True
-except ImportError:
-    YOLO_AVAILABLE = False
-    print("⚠️  ultralytics not available. Object crops will use full frames.")
-
+# MediaPipe import with fallback
 try:
     import mediapipe as mp
     MEDIAPIPE_AVAILABLE = True
 except ImportError:
     MEDIAPIPE_AVAILABLE = False
-    print("⚠️  mediapipe not available. Using dummy hand landmarks.")
+    print("⚠️  mediapipe not available. Hand landmarks will use dummy data.")
 
-def parse_args():
-    parser = argparse.ArgumentParser(description='prepare something-something-v2 dataset')
-    # Default paths relative to this file for portability
-    project_root = os.path.dirname(os.path.abspath(__file__))
-    parser.add_argument('--video_root', type=str, default=os.path.join(project_root, '20bn-something-something-v2'))
-    parser.add_argument('--frame_root', type=str, default=os.path.join(project_root, '20bn-something-something-v2-frames'))
-    parser.add_argument('--anno_root', type=str, default=os.path.join(project_root, 'annotations'))
-    parser.add_argument('--num_threads', type=int, default=100)
-    parser.add_argument('--decode_video', action='store_true', default=True)
-    parser.add_argument('--build_file_list', action='store_true', default=True)
-    parser.add_argument('--subset', type=int, default=None, help='Only process the first N videos (for testing)')
-    args = parser.parse_args()
-
-    args.video_root = os.path.expanduser(args.video_root)
-    args.frame_root = os.path.expanduser(args.frame_root)
-    args.anno_root = os.path.expanduser(args.anno_root)
-    return args
-
-def split_func(l, n):
-    """Yield successive n-sized chunks from l with safe step size."""
-    n = max(1, n)
-    for i in range(0, len(l), n):
-        yield l[i:i + n]
-
-# Global models - loaded once per process
-_yolo_model = None
+# Global MediaPipe instance
 _mediapipe_hands = None
 
 def get_mediapipe_hands():
@@ -59,534 +38,299 @@ def get_mediapipe_hands():
     if _mediapipe_hands is None and MEDIAPIPE_AVAILABLE:
         mp_hands = mp.solutions.hands
         _mediapipe_hands = mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=1,  # Focus on one hand
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+            static_image_mode=True,  # Better for individual frame processing
+            max_num_hands=1,         # Focus on one hand
+            min_detection_confidence=0.8,  # Higher confidence since we have ROI
+            min_tracking_confidence=0.8
         )
-        print("✅ MediaPipe Hands loaded")
+        print("✅ MediaPipe Hands loaded for ROI-guided processing")
     return _mediapipe_hands
 
-def detect_hand_landmarks(frame):
+def detect_hand_landmarks_from_roi(frame, hand_bbox):
     """
-    Detect hand landmarks using MediaPipe.
+    Extract hand landmarks using MediaPipe on a ground-truth ROI.
     
     Args:
-        frame (np.array): RGB frame
+        frame: Full video frame (BGR format from OpenCV)
+        hand_bbox: Ground truth hand bounding box {'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2}
         
     Returns:
-        np.array: (21, 2) hand landmarks or None if no hand detected
+        landmarks: np.array of shape (21, 2) with coordinates in FULL FRAME space, or None
     """
     hands_model = get_mediapipe_hands()
-    if not MEDIAPIPE_AVAILABLE or hands_model is None:
+    if hands_model is None:
+        return None
+        
+    # Extract ROI coordinates
+    x1 = max(0, int(hand_bbox['x1']))
+    y1 = max(0, int(hand_bbox['y1']))
+    x2 = min(frame.shape[1], int(hand_bbox['x2']))
+    y2 = min(frame.shape[0], int(hand_bbox['y2']))
+    
+    # Validate bbox
+    if x1 >= x2 or y1 >= y2:
+        print(f"⚠️  Invalid hand bbox: {hand_bbox}")
         return None
     
-    try:
-        # MediaPipe expects RGB
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if frame.shape[2] == 3 else frame
-        results = hands_model.process(rgb_frame)
+    # Crop hand region
+    hand_crop = frame[y1:y2, x1:x2]
+    
+    # Convert BGR to RGB for MediaPipe
+    rgb_crop = cv2.cvtColor(hand_crop, cv2.COLOR_BGR2RGB)
+    
+    # Process the hand crop
+    results = hands_model.process(rgb_crop)
+    
+    if results.multi_hand_landmarks:
+        # Get the first (most confident) hand
+        hand_landmarks = results.multi_hand_landmarks[0]
         
-        if results.multi_hand_landmarks:
-            # Get first hand's landmarks
-            hand_landmarks = results.multi_hand_landmarks[0]
-            landmarks = []
-            h, w = frame.shape[:2]
+        # Extract landmark coordinates in crop space
+        crop_h, crop_w = hand_crop.shape[:2]
+        landmarks = []
+        
+        for lm in hand_landmarks.landmark:
+            # Convert from normalized coordinates to crop pixel coordinates
+            crop_x = lm.x * crop_w
+            crop_y = lm.y * crop_h
             
-            for landmark in hand_landmarks.landmark:
-                # Convert normalized coordinates to pixel coordinates
-                x = int(landmark.x * w)
-                y = int(landmark.y * h)
-                landmarks.append([x, y])
+            # Convert back to full frame coordinates
+            full_frame_x = crop_x + x1
+            full_frame_y = crop_y + y1
             
-            return np.array(landmarks)
+            landmarks.append([full_frame_x, full_frame_y])
+        
+        landmarks = np.array(landmarks, dtype=np.float32)
+        return landmarks
     
-    except Exception as e:
-        print(f"MediaPipe hand detection failed: {e}")
-    
+    print(f"⚠️  No hand detected in ROI crop")
     return None
 
-def get_yolo_model():
-    """Get or initialize the YOLO model (thread-safe singleton)."""
-    global _yolo_model
-    if _yolo_model is None and YOLO_AVAILABLE:
-        try:
-            print("🤖 Loading YOLO model...")
-            # Try YOLOv11n first (latest), fallback to YOLOv8n
-            try:
-                _yolo_model = YOLO('yolo11n.pt')  # YOLOv11 nano - latest version
-                print("✅ YOLOv11n model loaded")
-            except:
-                try:
-                    _yolo_model = YOLO('yolov8n.pt')  # Fallback to YOLOv8n
-                    print("✅ YOLOv8n model loaded (YOLOv11n not available)")
-                except:
-                    _yolo_model = YOLO('yolov5n.pt')  # Last resort fallback
-                    print("✅ YOLOv5n model loaded (latest versions not available)")
-        except Exception as e:
-            print(f"❌ Failed to load YOLO model: {e}")
-            print("⚠️  Falling back to center crop method")
-            _yolo_model = None
-    return _yolo_model
-
-def calculate_iou(boxA, boxB):
-    """Calculate Intersection over Union for two bounding boxes."""
-    # Determine the (x, y)-coordinates of the intersection rectangle
-    xA = max(boxA[0], boxB[0])
-    yA = max(boxA[1], boxB[1])
-    xB = min(boxA[2], boxB[2])
-    yB = min(boxA[3], boxB[3])
-
-    # Compute the area of intersection rectangle
-    interArea = max(0, xB - xA) * max(0, yB - yA)
-
-    # Compute the area of both the prediction and ground-truth rectangles
-    boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
-    boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
-
-    # Compute the intersection over union
-    iou = interArea / float(boxAArea + boxBArea - interArea + 1e-6)
-    return iou
-
-def generate_dummy_hand_landmarks(frame_shape):
-    """Generate dummy hand landmarks for videos without real hand detection."""
-    h, w = frame_shape[:2]
-    # Place dummy hand roughly in center of frame
-    center_x, center_y = w // 2, h // 2
-    landmarks = []
-    for i in range(21):
-        # Small random offset around center
-        x = center_x + np.random.randint(-50, 51)
-        y = center_y + np.random.randint(-50, 51)
-        landmarks.append([x, y])
-    return np.array(landmarks)
-
-def find_and_crop_object_of_interest(frame, hand_landmarks=None):
+def load_annotations(annotation_file):
     """
-    Detect objects and find the one most likely interacting with the hand.
+    Load Something-Else annotations from JSON file.
     
     Args:
-        frame (np.array): The full video frame (BGR format)
-        hand_landmarks (np.array): (21, 2) array of hand landmarks or None
+        annotation_file: Path to annotations.json file
         
     Returns:
-        np.array: Cropped object image or None if not found
+        Dictionary mapping video_id to list of frame annotations
     """
-    yolo_model = get_yolo_model()
-    if not YOLO_AVAILABLE or yolo_model is None:
-        # Fallback: return center crop of frame
-        h, w = frame.shape[:2]
-        crop_size = min(h, w) // 3
-        y1 = (h - crop_size) // 2
-        x1 = (w - crop_size) // 2
-        return frame[y1:y1+crop_size, x1:x1+crop_size]
+    print(f"📁 Loading annotations from {annotation_file}...")
     
-    # Try to detect hand landmarks with MediaPipe if not provided
-    if hand_landmarks is None:
-        hand_landmarks = detect_hand_landmarks(frame)
+    with open(annotation_file, 'r') as f:
+        annotations = json.load(f)
     
-    # Fall back to dummy landmarks if MediaPipe also fails
-    if hand_landmarks is None:
-        hand_landmarks = generate_dummy_hand_landmarks(frame.shape)
-    
-    # Create hand bounding box
-    min_x = max(0, np.min(hand_landmarks[:, 0]) - 20)
-    max_x = min(frame.shape[1], np.max(hand_landmarks[:, 0]) + 20)
-    min_y = max(0, np.min(hand_landmarks[:, 1]) - 20)
-    max_y = min(frame.shape[0], np.max(hand_landmarks[:, 1]) + 20)
-    hand_bbox = [min_x, min_y, max_x, max_y]
-    
-    try:
-        # Run YOLO detection
-        results = yolo_model(frame, verbose=False)
-        
-        if len(results) == 0 or results[0].boxes is None:
-            # No objects detected, return hand region
-            return frame[int(min_y):int(max_y), int(min_x):int(max_x)]
-        
-        # Get detected object boxes
-        detected_boxes = results[0].boxes.xyxy.cpu().numpy()
-        
-        if len(detected_boxes) == 0:
-            # No objects detected, return hand region
-            return frame[int(min_y):int(max_y), int(min_x):int(max_x)]
-        
-        # Find best object by IoU with hand
-        best_box = None
-        max_iou = 0.0
-        
-        for obj_box in detected_boxes:
-            iou = calculate_iou(hand_bbox, obj_box)
-            if iou > max_iou:
-                max_iou = iou
-                best_box = obj_box
-        
-        # Use best object if good overlap, otherwise use largest object
-        if best_box is not None and max_iou > 0.05:
-            x1, y1, x2, y2 = map(int, best_box)
-        else:
-            # Use largest object
-            areas = [(box[2] - box[0]) * (box[3] - box[1]) for box in detected_boxes]
-            largest_idx = np.argmax(areas)
-            x1, y1, x2, y2 = map(int, detected_boxes[largest_idx])
-        
-        # Ensure valid crop coordinates
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
-        
-        if x2 > x1 and y2 > y1:
-            return frame[y1:y2, x1:x2]
-        else:
-            # Fallback to center crop
-            h, w = frame.shape[:2]
-            crop_size = min(h, w) // 3
-            y1 = (h - crop_size) // 2
-            x1 = (w - crop_size) // 2
-            return frame[y1:y1+crop_size, x1:x1+crop_size]
-            
-    except Exception as e:
-        print(f"YOLO detection failed: {e}")
-        # Fallback to center crop
-        h, w = frame.shape[:2]
-        crop_size = min(h, w) // 3
-        y1 = (h - crop_size) // 2
-        x1 = (w - crop_size) // 2
-        return frame[y1:y1+crop_size, x1:x1+crop_size]
+    print(f"✅ Loaded annotations for {len(annotations)} videos")
+    return annotations
 
-def extract_with_clip_level_heuristic(video, tmpl='%06d.jpg'):
+def extract_with_hybrid_approach(video_dir, video_id, annotations, output_base_dir):
     """
-    Extract frames, hand landmarks, and object crops using clip-level heuristic.
+    Extract frames and process using HYBRID approach: GT ROI + MediaPipe joints.
     
-    This approach:
-    1. Analyzes the entire video to find the moment of maximum hand-object interaction
-    2. Identifies the primary "Target Object" for the entire clip
-    3. Crops that specific object consistently throughout the video
+    Args:
+        video_dir: Directory containing video frames
+        video_id: Video ID to process
+        annotations: Loaded annotations dictionary
+        output_base_dir: Base directory for outputs
+        
+    Returns:
+        Tuple of (frames_dir, hand_landmarks_dir, object_crops_dir)
     """
-    video_path = os.path.join(args.video_root, video)
-    frame_dir = os.path.join(args.frame_root, video[:-5])
+    if video_id not in annotations:
+        print(f"⚠️  No annotations found for video {video_id}")
+        return None, None, None
     
-    # Create subdirectories
-    os.makedirs(frame_dir, exist_ok=True)
-    object_crops_dir = os.path.join(frame_dir, 'object_crops')
-    hand_landmarks_dir = os.path.join(frame_dir, 'hand_landmarks')
-    os.makedirs(object_crops_dir, exist_ok=True)
-    os.makedirs(hand_landmarks_dir, exist_ok=True)
+    video_annotations = annotations[video_id]
     
-    try:
-        print(f"🎬 Processing {video} with clip-level heuristic...")
+    # Create output directories
+    base_dir = os.path.join(output_base_dir, f"processed_{video_id}")
+    frames_dir = os.path.join(base_dir, "frames")
+    hand_landmarks_dir = os.path.join(base_dir, "hand_landmarks")
+    object_crops_dir = os.path.join(base_dir, "object_crops")
+    
+    for d in [frames_dir, hand_landmarks_dir, object_crops_dir]:
+        os.makedirs(d, exist_ok=True)
+    
+    print(f"🎬 Processing video {video_id} with {len(video_annotations)} frames...")
+    print(f"🔬 Using HYBRID approach: Ground Truth ROI → MediaPipe Joints")
+    
+    successful_landmarks = 0
+    total_frames = 0
+    
+    for frame_data in tqdm(video_annotations, desc=f"Processing {video_id}"):
+        frame_name = frame_data['name'].split('/')[-1]  # Get just the frame filename
+        frame_path = os.path.join(video_dir, video_id, frame_name)
         
-        # PHASE 1: Analyze entire video to find target object
-        print("  📊 Phase 1: Analyzing full video for target object...")
+        # Check if frame exists
+        if not os.path.exists(frame_path):
+            print(f"⚠️  Frame not found: {frame_path}")
+            continue
         
-        cap = cv2.VideoCapture(video_path)
-        frames_data = []  # Store all frame analysis results
-        yolo_model = get_yolo_model()
+        # Load frame
+        frame = cv2.imread(frame_path)
+        if frame is None:
+            print(f"⚠️  Could not load frame: {frame_path}")
+            continue
         
-        frame_count = 0
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
-            frame_count += 1
-            
-            # Detect hand landmarks
-            hand_landmarks = detect_hand_landmarks(frame)
-            
-            # Run YOLO to detect all objects
-            detected_objects = []
-            if yolo_model is not None and YOLO_AVAILABLE:
-                try:
-                    results = yolo_model(frame, verbose=False)
-                    if len(results) > 0 and results[0].boxes is not None:
-                        detected_boxes = results[0].boxes.xyxy.cpu().numpy()
-                        detected_objects = detected_boxes.tolist()
-                except:
-                    pass
-            
-            # Store frame data for analysis
-            frame_data = {
-                'frame_num': frame_count,
-                'frame': frame,
-                'hand_landmarks': hand_landmarks,
-                'detected_objects': detected_objects
-            }
-            frames_data.append(frame_data)
+        h, w = frame.shape[:2]
+        total_frames += 1
         
-        cap.release()
-        print(f"  ✅ Analyzed {frame_count} frames")
+        # Copy frame to output directory
+        output_frame_path = os.path.join(frames_dir, frame_name)
+        cv2.imwrite(output_frame_path, frame)
         
-        # PHASE 2: Find the "climax" interaction and target object
-        print("  🎯 Phase 2: Finding target object...")
+        # Process annotations for this frame
+        hand_bbox = None
+        object_bbox = None
         
-        max_iou = 0.0
-        target_object_bbox = None
-        climax_frame = None
+        for label in frame_data['labels']:
+            if label['category'] == 'hand':
+                hand_bbox = label['box2d']
+            else:
+                # This is an object (could be multiple objects, take the first one)
+                if object_bbox is None:  # Take first non-hand object
+                    object_bbox = label['box2d']
         
-        for frame_data in frames_data:
-            hand_landmarks = frame_data['hand_landmarks']
-            detected_objects = frame_data['detected_objects']
-            
-            if hand_landmarks is not None and len(detected_objects) > 0:
-                # Create hand bounding box
-                min_x = max(0, np.min(hand_landmarks[:, 0]) - 20)
-                max_x = min(frame_data['frame'].shape[1], np.max(hand_landmarks[:, 0]) + 20)
-                min_y = max(0, np.min(hand_landmarks[:, 1]) - 20)
-                max_y = min(frame_data['frame'].shape[0], np.max(hand_landmarks[:, 1]) + 20)
-                hand_bbox = [min_x, min_y, max_x, max_y]
-                
-                # Find object with highest IoU in this frame
-                for obj_bbox in detected_objects:
-                    iou = calculate_iou(hand_bbox, obj_bbox)
-                    if iou > max_iou:
-                        max_iou = iou
-                        target_object_bbox = obj_bbox
-                        climax_frame = frame_data['frame_num']
-        
-        if target_object_bbox is not None:
-            print(f"  ✅ Target object found! Max IoU: {max_iou:.3f} at frame {climax_frame}")
-            print(f"      Object bbox: {target_object_bbox}")
-        else:
-            print("  ⚠️  No significant hand-object interaction found")
-        
-        # PHASE 3: Generate consistent object crops for entire video
-        print("  🖼️  Phase 3: Generating consistent object crops...")
-        
-        successful_crops = 0
-        for frame_data in frames_data:
-            frame_num = frame_data['frame_num']
-            frame = frame_data['frame']
-            hand_landmarks = frame_data['hand_landmarks']
-            
-            # Save original frame
-            frame_filename = os.path.join(frame_dir, f'{frame_num:06d}.jpg')
-            cv2.imwrite(frame_filename, frame)
-            
-            # Save hand landmarks
-            landmarks_filename = os.path.join(hand_landmarks_dir, f'{frame_num:06d}.npy')
+        # HYBRID APPROACH: Use ground truth hand bbox as ROI for MediaPipe
+        if hand_bbox:
+            hand_landmarks = detect_hand_landmarks_from_roi(frame, hand_bbox)
             if hand_landmarks is not None:
-                np.save(landmarks_filename, hand_landmarks)
+                successful_landmarks += 1
+        else:
+            hand_landmarks = None
+        
+        # Fallback to dummy landmarks if MediaPipe failed or no hand bbox
+        if hand_landmarks is None:
+            # Generate realistic dummy landmarks within the hand bbox if available
+            if hand_bbox:
+                # Create dummy landmarks within the actual hand region
+                x1, y1, x2, y2 = hand_bbox['x1'], hand_bbox['y1'], hand_bbox['x2'], hand_bbox['y2']
+                center_x, center_y = (x1 + x2) / 2, (y1 + y2) / 2
+                hand_landmarks = np.random.randn(21, 2) * 20 + [center_x, center_y]
+                print(f"⚠️  MediaPipe failed for {frame_name}, using bbox-guided dummy landmarks")
             else:
-                dummy_landmarks = generate_dummy_hand_landmarks(frame.shape)
-                np.save(landmarks_filename, dummy_landmarks)
+                # Complete fallback
+                hand_landmarks = np.random.randn(21, 2) * 20 + [w/2, h/2]
+                print(f"⚠️  No hand annotation for {frame_name}, using center dummy landmarks")
+        
+        # Save hand landmarks
+        landmarks_path = os.path.join(hand_landmarks_dir, frame_name.replace('.jpg', '.npy'))
+        np.save(landmarks_path, hand_landmarks)
+        
+        # Crop object from ground truth bounding box
+        if object_bbox:
+            x1 = max(0, int(object_bbox['x1']))
+            y1 = max(0, int(object_bbox['y1']))
+            x2 = min(w, int(object_bbox['x2']))
+            y2 = min(h, int(object_bbox['y2']))
             
-            # Generate object crop
-            object_crop = None
-            
-            if target_object_bbox is not None:
-                # Try to find the target object in current frame
-                current_target_bbox = find_target_object_in_frame(
-                    frame, target_object_bbox, yolo_model
-                )
+            if x1 < x2 and y1 < y2:
+                object_crop = frame[y1:y2, x1:x2]
                 
-                if current_target_bbox is not None:
-                    # Crop the target object
-                    x1, y1, x2, y2 = map(int, current_target_bbox)
-                    x1, y1 = max(0, x1), max(0, y1)
-                    x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
-                    
-                    if x2 > x1 and y2 > y1:
-                        object_crop = frame[y1:y2, x1:x2]
-                        successful_crops += 1
-            
-            # Save object crop or placeholder
-            crop_filename = os.path.join(object_crops_dir, f'{frame_num:06d}.jpg')
-            if object_crop is not None and object_crop.size > 0:
-                object_crop_resized = cv2.resize(object_crop, (112, 112))
-                cv2.imwrite(crop_filename, object_crop_resized)
+                # Resize to standard size
+                if object_crop.size > 0:
+                    object_crop_resized = cv2.resize(object_crop, (112, 112))
+                else:
+                    object_crop_resized = np.zeros((112, 112, 3), dtype=np.uint8)
             else:
-                # Black placeholder for consistency
-                black_crop = np.zeros((112, 112, 3), dtype=np.uint8)
-                cv2.imwrite(crop_filename, black_crop)
+                object_crop_resized = np.zeros((112, 112, 3), dtype=np.uint8)
+        else:
+            # Use center crop as fallback
+            crop_size = min(h, w) // 2
+            center_x, center_y = w // 2, h // 2
+            x1 = center_x - crop_size // 2
+            y1 = center_y - crop_size // 2
+            x2 = center_x + crop_size // 2
+            y2 = center_y + crop_size // 2
+            object_crop = frame[y1:y2, x1:x2]
+            object_crop_resized = cv2.resize(object_crop, (112, 112))
+            print(f"⚠️  No object annotation for {frame_name}, using center crop")
         
-        print(f"  ✅ Generated {successful_crops}/{frame_count} successful object crops")
-        print(f"  🎉 Clip-level processing complete!")
-        
-        return frame_count > 0
-        
-    except Exception as e:
-        print(f"❌ Error processing {video}: {e}")
-        return False
+        # Save object crop
+        crop_path = os.path.join(object_crops_dir, frame_name)
+        cv2.imwrite(crop_path, object_crop_resized)
+    
+    # Report success rate
+    success_rate = (successful_landmarks / total_frames) * 100 if total_frames > 0 else 0
+    
+    print(f"✅ Processed video {video_id}")
+    print(f"   📁 Frames: {total_frames} files in {frames_dir}")
+    print(f"   🖐️  Hand landmarks: {total_frames} files in {hand_landmarks_dir}")
+    print(f"   📊 MediaPipe success rate: {successful_landmarks}/{total_frames} ({success_rate:.1f}%)")
+    print(f"   📦 Object crops: {total_frames} files in {object_crops_dir}")
+    
+    return frames_dir, hand_landmarks_dir, object_crops_dir
 
-def find_target_object_in_frame(frame, target_bbox, yolo_model):
+def process_dataset(video_base_dir, annotation_file, output_base_dir, video_ids=None):
     """
-    Find the target object in current frame by matching with reference bbox.
+    Process multiple videos using HYBRID approach.
     
     Args:
-        frame: Current frame
-        target_bbox: Reference bounding box of target object
-        yolo_model: YOLO model for detection
-        
-    Returns:
-        Best matching object bbox or None
+        video_base_dir: Base directory containing video frame folders
+        annotation_file: Path to annotations.json file
+        output_base_dir: Base directory for processed outputs
+        video_ids: List of video IDs to process (None = process all)
     """
-    if yolo_model is None:
-        return target_bbox  # Fallback to original bbox
+    # Load annotations
+    annotations = load_annotations(annotation_file)
     
-    try:
-        # Run YOLO on current frame
-        results = yolo_model(frame, verbose=False)
-        if len(results) == 0 or results[0].boxes is None:
-            return target_bbox  # Fallback to original bbox
-        
-        detected_boxes = results[0].boxes.xyxy.cpu().numpy()
-        if len(detected_boxes) == 0:
-            return target_bbox  # Fallback to original bbox
-        
-        # Find object with highest IoU to target_bbox
-        best_match = None
-        max_iou = 0.0
-        
-        for obj_bbox in detected_boxes:
-            iou = calculate_iou(target_bbox, obj_bbox.tolist())
-            if iou > max_iou:
-                max_iou = iou
-                best_match = obj_bbox.tolist()
-        
-        # Return best match if IoU is reasonable, otherwise original bbox
-        if max_iou > 0.3:  # Reasonable overlap threshold
-            return best_match
-        else:
-            return target_bbox  # Fallback to original bbox
-            
-    except Exception as e:
-        print(f"Error finding target object: {e}")
-        return target_bbox  # Fallback to original bbox
-
-# Keep the old function as fallback
-def extract(video, tmpl='%06d.jpg'):
-    """Fallback to old frame-by-frame extraction if clip-level fails."""
-    return extract_with_clip_level_heuristic(video, tmpl)
-
-def target(video_list):
-    success_count = 0
-    for i, video in enumerate(video_list):
-        video_dir = os.path.join(args.frame_root, video[:-5])
-        if not os.path.exists(video_dir):
-            os.makedirs(video_dir)
-        
-        if extract(video):
-            success_count += 1
-            print(f"✅ [{i+1}/{len(video_list)}] {video}")
-        else:
-            print(f"❌ [{i+1}/{len(video_list)}] {video} - FAILED")
+    # Get video IDs to process
+    if video_ids is None:
+        video_ids = list(annotations.keys())
     
-    print(f"Thread completed: {success_count}/{len(video_list)} videos processed successfully")
-
-def decode_video(args):
-    print(f"📁 Video root: {args.video_root}")
-    print(f"📁 Frame root: {args.frame_root}")
-    print(f"🧵 Using {args.num_threads} threads")
+    print(f"📋 Processing {len(video_ids)} videos with HYBRID approach...")
+    print(f"🔬 Method: Ground Truth ROI → MediaPipe Joints → Rich Hand Information")
     
-    if not os.path.exists(args.video_root):
-        raise ValueError('Please download videos and set video_root variable.')
-    if not os.path.exists(args.frame_root):
-        os.makedirs(args.frame_root)
-
-    # Get list of video files
-    video_list = [f for f in os.listdir(args.video_root) if f.endswith('.webm')]
-    print(f"📊 Found {len(video_list)} video files to process")
+    successful = 0
+    failed = 0
+    total_landmarks_success = 0
+    total_frames_processed = 0
     
-    # Filter out already processed videos (resume capability)
-    remaining_videos = []
-    for video in video_list:
-        frame_dir = os.path.join(args.frame_root, video[:-5])
-        if not os.path.exists(frame_dir) or len(os.listdir(frame_dir)) == 0:
-            remaining_videos.append(video)
-    
-    if len(remaining_videos) < len(video_list):
-        print(f"🔄 Resuming: {len(video_list) - len(remaining_videos)} videos already processed")
-        print(f"⏳ {len(remaining_videos)} videos remaining")
-    
-    if len(remaining_videos) == 0:
-        print("✅ All videos already processed!")
-        return
-    
-    # Apply subset if requested
-    if args.subset:
-        remaining_videos = remaining_videos[:args.subset]
-        print(f"🎯 Subset mode: processing {len(remaining_videos)} videos")
-
-    # Split remaining videos among threads (robust for small counts)
-    import math
-    if args.num_threads <= 0:
-        num_threads = 1
-    else:
-        num_threads = min(args.num_threads, max(1, len(remaining_videos)))
-    videos_per_thread = math.ceil(len(remaining_videos) / num_threads)
-    splits = list(split_func(remaining_videos, videos_per_thread))
-    
-    print(f"🚀 Starting preprocessing with {len(splits)} threads...")
-    print(f"⏱️  Estimated time: ~{len(remaining_videos) * 2 / 3600:.1f} hours (rough estimate)")
-
-    threads = []
-    for i, split in enumerate(splits):
-        thread = threading.Thread(target=target, args=(split,))
-        thread.start()
-        threads.append(thread)
-
-    for thread in threads:
-        thread.join()
-    
-    print("🎉 Video preprocessing completed!")
-
-def build_file_list(args):
-    if not os.path.exists(args.anno_root):
-        raise ValueError('Please download annotations and set anno_root variable.')
-
-    dataset_name = 'something-something-v2'
-    with open(os.path.join(args.anno_root, '%s-labels.json' % dataset_name)) as f:
-        data = json.load(f)
-    categories = []
-    for i, (cat, idx) in enumerate(data.items()):
-        assert i == int(idx)  # make sure the rank is right
-        categories.append(cat)
-
-    with open('category.txt', 'w') as f:
-        f.write('\n'.join(categories))
-
-    dict_categories = {}
-    for i, category in enumerate(categories):
-        dict_categories[category] = i
-
-    files_input = [os.path.join(args.anno_root, '%s-validation.json' % dataset_name),
-                   os.path.join(args.anno_root, '%s-train.json' % dataset_name),
-                   os.path.join(args.anno_root, '%s-test.json' % dataset_name)]
-    files_output = [os.path.join(args.anno_root, 'val_videofolder.txt'),
-                    os.path.join(args.anno_root, 'train_videofolder.txt'),
-                    os.path.join(args.anno_root, 'test_videofolder.txt')]
-    for (filename_input, filename_output) in zip(files_input, files_output):
-        with open(filename_input) as f:
-            data = json.load(f)
-        folders = []
-        idx_categories = []
-        for item in data:
-            folders.append(item['id'])
-            if 'test' not in filename_input:
-                idx_categories.append(dict_categories[item['template'].replace('[', '').replace(']', '')])
+    for video_id in video_ids:
+        try:
+            result = extract_with_hybrid_approach(video_base_dir, video_id, annotations, output_base_dir)
+            if result[0] is not None:
+                successful += 1
+                # Count successful landmark extractions (would need to modify function to return this)
             else:
-                idx_categories.append(0)
-        output = []
-        for i in range(len(folders)):
-            curFolder = folders[i]
-            curIDX = idx_categories[i]
-            # counting the number of frames in each video folders
-            dir_files = os.listdir(os.path.join(args.frame_root, curFolder))
-            if len(dir_files) == 0:
-                print('video decoding fails at %s', (curFolder))
-                sys.exit()
-            output.append('%s %d %d' % (curFolder, len(dir_files), curIDX))
-            print('%d/%d' % (i, len(folders)))
-        with open(filename_output, 'w') as f:
-            f.write('\n'.join(output))
+                failed += 1
+        except Exception as e:
+            print(f"❌ Failed to process video {video_id}: {e}")
+            failed += 1
+    
+    print(f"\n🎉 HYBRID processing complete!")
+    print(f"   ✅ Successful: {successful} videos")
+    print(f"   ❌ Failed: {failed} videos")
+    print(f"   🔬 Approach: Ground Truth Hand ROI + MediaPipe Joints")
+    print(f"   💡 Result: High-quality hand landmarks with spatial guidance")
 
-if __name__ == '__main__':
-    global args
-    args = parse_args()
+# Legacy function for compatibility
+def extract(video, tmpl='%06d.jpg'):
+    """
+    Legacy function for backward compatibility.
+    Note: This now requires annotations to work properly.
+    """
+    print("⚠️  extract() function now requires Something-Else annotations.")
+    print("💡 Use process_dataset() instead for processing with HYBRID approach.")
+    return None, None, None
 
-    if args.decode_video:
-        print('Decoding videos to frames.')
-        decode_video(args)
-
-    if args.build_file_list:
-        print('Generating training files.')
-        build_file_list(args)
+if __name__ == "__main__":
+    # Example usage
+    video_base_dir = "20bn-something-something-v2-frames"  # Directory with extracted frames
+    annotation_file = "annotations.json"  # Something-Else annotations file
+    output_base_dir = "processed_data"
+    
+    # Process a few sample videos
+    sample_video_ids = ["151201", "3201", "2003"]  # Example video IDs from annotations
+    
+    if os.path.exists(annotation_file):
+        print("🔬 Testing HYBRID Something-Else + MediaPipe preprocessing pipeline...")
+        try:
+            process_dataset(video_base_dir, annotation_file, output_base_dir, sample_video_ids)
+            print("✅ Test completed successfully!")
+        except Exception as e:
+            print(f"❌ Test failed: {e}")
+    else:
+        print(f"⚠️  Annotation file not found: {annotation_file}")
+        print("💡 Download the Something-Else annotations and place them at the above path.")

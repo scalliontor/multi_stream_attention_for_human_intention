@@ -18,7 +18,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 class SimpleDataset(Dataset):
-    def __init__(self, frame_root, annotation_file, max_samples=1000):
+    def __init__(self, frame_root, annotation_file, max_samples=1000, labels_file=None):
         # Load annotations for videos we have
         with open(annotation_file, 'r') as f:
             all_annotations = json.load(f)
@@ -26,12 +26,34 @@ class SimpleDataset(Dataset):
         available_videos = set(os.listdir(frame_root))
         self.annotations = [s for s in all_annotations if s['id'] in available_videos][:max_samples]
         
-        with open('/something-something-v2-labels.json', 'r') as f:
-            labels = json.load(f)
-            # Create proper class_to_idx mapping (convert string indices to int)
-            self.class_to_idx = {k: int(v) for k, v in labels.items()}
-            # Also create idx_to_class for reverse lookup
-            self.idx_to_class = {int(v): k for k, v in labels.items()}
+        # Load labels file - try different locations
+        if labels_file is None:
+            # Try common locations
+            possible_labels = [
+                '20bn-something-something-download-package-labels/labels/something-something-v2-labels.json',
+                'something-something-v2-labels.json',
+                '/something-something-v2-labels.json',
+                'test_labels.json'  # For testing
+            ]
+            labels_file = None
+            for path in possible_labels:
+                if os.path.exists(path):
+                    labels_file = path
+                    break
+        
+        if labels_file and os.path.exists(labels_file):
+            with open(labels_file, 'r') as f:
+                labels = json.load(f)
+                # Create proper class_to_idx mapping (convert string indices to int)
+                self.class_to_idx = {k: int(v) for k, v in labels.items()}
+                # Also create idx_to_class for reverse lookup
+                self.idx_to_class = {int(v): k for k, v in labels.items()}
+        else:
+            # Fallback: create a simple mapping
+            print("⚠️  No labels file found, creating simple mapping")
+            unique_templates = list(set([s.get('template', '') for s in self.annotations]))
+            self.class_to_idx = {template: i for i, template in enumerate(unique_templates)}
+            self.idx_to_class = {i: template for template, i in self.class_to_idx.items()}
         
         self.frame_root = frame_root
         self.transform = transforms.Compose([
@@ -65,12 +87,12 @@ class SimpleDataset(Dataset):
             except:
                 continue
         
-        # Load YOLO-extracted object crops
+        # Load Something-Else annotation-based object crops
         object_crops_dir = os.path.join(frame_dir, 'object_crops')
         object_crops = []
         
         if os.path.exists(object_crops_dir):
-            # Load object crops extracted by YOLO preprocessing
+            # Load object crops extracted from Something-Else annotations
             crop_files = sorted([f for f in os.listdir(object_crops_dir) if f.endswith('.jpg')])[:30]
             for f in crop_files:
                 try:
@@ -102,12 +124,12 @@ class SimpleDataset(Dataset):
                 object_crops.append(zero_frame)
             object_crops = object_crops[:30]
         
-        # Load real hand landmarks (detected by MediaPipe during preprocessing)
+        # Load hand landmarks (derived from Something-Else annotations during preprocessing)
         hand_landmarks_dir = os.path.join(frame_dir, 'hand_landmarks')
         hand_landmarks_sequence = []
         
         if os.path.exists(hand_landmarks_dir):
-            # Load MediaPipe-detected landmarks
+            # Load annotation-derived landmarks
             landmark_files = sorted([f for f in os.listdir(hand_landmarks_dir) if f.endswith('.npy')])[:30]
             for f in landmark_files:
                 try:
