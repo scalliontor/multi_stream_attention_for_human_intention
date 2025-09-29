@@ -162,7 +162,7 @@ def extract_with_hybrid_approach(video_dir, video_id, annotations, output_base_d
         os.makedirs(d, exist_ok=True)
     
     print(f"🎬 Processing video {video_id} with {len(video_annotations)} frames...")
-    print(f"🔬 Using IMPROVED approach: MediaPipe Full Frame + Ground Truth Validation")
+    print(f"🔬 Using IMPROVED approach: MediaPipe Full Frame + Smart Object Selection")
     
     successful_landmarks = 0
     total_frames = 0
@@ -191,15 +191,43 @@ def extract_with_hybrid_approach(video_dir, video_id, annotations, output_base_d
         
         # Process annotations for this frame
         hand_bbox = None
-        object_bbox = None
+        object_candidates = []
         
+        # Collect all annotations
         for label in frame_data['labels']:
             if label['category'] == 'hand':
                 hand_bbox = label['box2d']
             else:
-                # This is an object (could be multiple objects, take the first one)
-                if object_bbox is None:  # Take first non-hand object
-                    object_bbox = label['box2d']
+                # Collect all non-hand objects
+                object_candidates.append(label['box2d'])
+        
+        # Smart object selection: closest to hand, or largest if no hand
+        object_bbox = None
+        if object_candidates:
+            if hand_bbox:
+                # Option 2: Select object closest to hand
+                hand_center_x = (hand_bbox['x1'] + hand_bbox['x2']) / 2
+                hand_center_y = (hand_bbox['y1'] + hand_bbox['y2']) / 2
+                
+                min_distance = float('inf')
+                for obj_bbox in object_candidates:
+                    obj_center_x = (obj_bbox['x1'] + obj_bbox['x2']) / 2
+                    obj_center_y = (obj_bbox['y1'] + obj_bbox['y2']) / 2
+                    
+                    # Calculate distance between hand and object centers
+                    distance = ((hand_center_x - obj_center_x) ** 2 + (hand_center_y - obj_center_y) ** 2) ** 0.5
+                    
+                    if distance < min_distance:
+                        min_distance = distance
+                        object_bbox = obj_bbox
+            else:
+                # Fallback: Select largest object (most prominent in scene)
+                largest_area = 0
+                for obj_bbox in object_candidates:
+                    area = (obj_bbox['x2'] - obj_bbox['x1']) * (obj_bbox['y2'] - obj_bbox['y1'])
+                    if area > largest_area:
+                        largest_area = area
+                        object_bbox = obj_bbox
         
         # IMPROVED APPROACH: MediaPipe on full frame, validate with ground truth
         hand_landmarks = detect_hand_landmarks_full_frame(frame, hand_bbox)
@@ -311,8 +339,8 @@ def process_dataset(video_base_dir, annotation_file, output_base_dir, video_ids=
     print(f"\n🎉 IMPROVED processing complete!")
     print(f"   ✅ Successful: {successful} videos")
     print(f"   ❌ Failed: {failed} videos")
-    print(f"   🔬 Approach: MediaPipe Full Frame + Ground Truth Validation")
-    print(f"   💡 Result: Natural hand detection with ground truth guidance")
+    print(f"   🔬 Approach: MediaPipe Full Frame + Smart Object Selection")
+    print(f"   💡 Result: Natural hand detection + contextually relevant objects")
 
 # Legacy function for compatibility
 def extract(video, tmpl='%06d.jpg'):
