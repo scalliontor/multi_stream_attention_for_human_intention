@@ -316,21 +316,38 @@ def extract(video, tmpl='%06d.jpg'):
     return None, None, None
 
 if __name__ == "__main__":
-    # Example usage
-    video_base_dir = "20bn-something-something-v2-frames"  # Directory with extracted frames
-    annotation_file = "annotations.json"  # Something-Else annotations file
-    output_base_dir = "processed_data"
+    import argparse
     
-    # Process a few sample videos
-    sample_video_ids = ["151201", "3201", "2003"]  # Example video IDs from annotations
+    parser = argparse.ArgumentParser(description='HYBRID preprocessing: GT ROI + MediaPipe')
+    parser.add_argument('--frames_dir', default='frames', help='Directory with extracted frames')
+    parser.add_argument('--annotations', default='annotations.json', help='Merged annotations file')
+    parser.add_argument('--output', default='processed_data', help='Output directory')
+    parser.add_argument('--max_videos', type=int, default=None, help='Limit number of videos (for testing)')
     
-    if os.path.exists(annotation_file):
-        print("🔬 Testing HYBRID Something-Else + MediaPipe preprocessing pipeline...")
+    args = parser.parse_args()
+    
+    if os.path.exists(args.annotations):
+        print("🔬 HYBRID Something-Else + MediaPipe preprocessing pipeline...")
+        print(f"📁 Frames: {args.frames_dir}")
+        print(f"📄 Annotations: {args.annotations}")
+        print(f"📁 Output: {args.output}")
+        
         try:
-            process_dataset(video_base_dir, annotation_file, output_base_dir, sample_video_ids)
-            print("✅ Test completed successfully!")
+            # Load annotations to get video list
+            with open(args.annotations, 'r') as f:
+                annotations = json.load(f)
+            
+            video_ids = list(annotations.keys())
+            if args.max_videos:
+                video_ids = video_ids[:args.max_videos]
+                print(f"🎯 Processing {len(video_ids)} videos (limited for testing)")
+            else:
+                print(f"📊 Processing {len(video_ids)} videos")
+            
+            process_dataset(args.frames_dir, args.annotations, args.output, video_ids)
+            print("✅ HYBRID preprocessing completed successfully!")
         except Exception as e:
-            print(f"❌ Test failed: {e}")
+            print(f"❌ Processing failed: {e}")
     else:
-        print(f"⚠️  Annotation file not found: {annotation_file}")
-        print("💡 Download the Something-Else annotations and place them at the above path.")
+        print(f"⚠️  Annotation file not found: {args.annotations}")
+        print("💡 Run merge_annotations.py first to create the merged annotation file.")

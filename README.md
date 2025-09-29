@@ -30,9 +30,25 @@ pip install -r requirements.txt
   - `something-something-v2-labels.json`
 - **Bounding Box Annotations**: Something-Else (4 parts) from https://drive.google.com/drive/folders/1XqZC2jIHqrLPugPOVJxCH_YWa275PBrZ
   - `bounding_box_smthsmth_part1.json`
+  gdown --id 1OlggVsZt8eLOI33C3GKAp9EHajMqxQ_Y -O bounding_box_smthsmth_part1.json
+
   - `bounding_box_smthsmth_part2.json`
+  gdown --id 10GQ3RINLAwnw7C2c91Lo17TuD2HnoRgr -O bounding_box_smthsmth_part2.json
+
   - `bounding_box_smthsmth_part3.json`
+  gdown --id 1-kebQmdN4lE6NI3CxGeKLKNJqwaT8uRG -O bounding_box_smthsmth_part3.json
+
   - `bounding_box_smthsmth_part4.json`
+  gdown --id 1oVkc4o8LaWZhF7DLDtqAEVYKOcG0dNjQ -O bounding_box_smthsmth_part4.json
+
+
+  gdown --id 1WxdhKsftmh5owWsI4_XleDlHP3BG2tvO -O something-something-v2-validation.json
+
+  gdown --id 1w2Vv0RJexb_3m1SdJ20QrkrI4NQH4ZzG -O something-something-v2-train.json
+
+  gdown --id 1hjOyH74BBLwtHwLOQB9H8E5GsyWV7JHE -O something-something-v2-test.json
+  
+  gdown --id 1gBmFFtxlj8LLVey7w5PPOILvhcGlyI_r -O something-something-v2-labels.json
 
 ## 📁 Required Folder Structure
 
