@@ -23,17 +23,72 @@ pip install -r requirements.txt
 
 ### 2. Download Data
 - **Videos**: Something-Something-v2 from https://20bn.com/datasets/something-something
-- **Annotations**: Something-Else (4 parts) from https://drive.google.com/drive/folders/1XqZC2jIHqrLPugPOVJxCH_YWa275PBrZ
+- **Dataset Labels**: Download these 4 files from Something-Something-v2:
+  - `something-something-v2-train.json`
+  - `something-something-v2-validation.json` 
+  - `something-something-v2-test.json`
+  - `something-something-v2-labels.json`
+- **Bounding Box Annotations**: Something-Else (4 parts) from https://drive.google.com/drive/folders/1XqZC2jIHqrLPugPOVJxCH_YWa275PBrZ
+  - `bounding_box_smthsmth_part1.json`
+  - `bounding_box_smthsmth_part2.json`
+  - `bounding_box_smthsmth_part3.json`
+  - `bounding_box_smthsmth_part4.json`
+
+## 📁 Required Folder Structure
+
+Your project should look like this:
+```
+multi_stream_attention_for_human_intention/
+├── README.md
+├── model.py
+├── train.py
+├── preprocess.py
+├── inference.py
+├── test.py
+├── extract_frames.py
+├── merge_annotations.py
+├── requirements.txt
+├── videos/
+│   ├── 20bn-something-something-v2/     # Extracted .webm video files
+│   ├── full.zip                         # Original download (can delete after extract)
+│   ├── part0.zip                        # Original download (can delete after extract)
+│   └── part1.zip                        # Original download (can delete after extract)
+├── bounding_box_smthsmth_part1.json     # Something-Else annotations
+├── bounding_box_smthsmth_part2.json     # (Download these 4 files)
+├── bounding_box_smthsmth_part3.json
+├── bounding_box_smthsmth_part4.json
+├── something-something-v2-train.json    # Training split
+├── something-something-v2-validation.json # Validation split
+├── something-something-v2-test.json     # Test split
+├── something-something-v2-labels.json   # Action class labels
+└── annotations.json                     # Created by merge_annotations.py
+```
+
+After processing, you'll also have:
+```
+├── frames/                              # Created by extract_frames.py
+│   ├── video_id_1/
+│   │   ├── 0001.jpg
+│   │   ├── 0002.jpg
+│   │   └── ...
+│   └── video_id_2/
+└── processed_data/                      # Created by preprocess.py
+    ├── video_id_1/
+    │   ├── frames/
+    │   ├── hand_landmarks/
+    │   └── object_crops/
+    └── video_id_2/
+```
 
 ### 3. Process Data
 ```bash
-# Merge annotations
+# Merge annotations (4 parts into 1 file)
 python merge_annotations.py --input_dir . --output annotations.json
 
-# Extract frames
-python extract_frames.py --video_dir videos/ --output_dir frames/
+# Extract frames from .webm videos
+python extract_frames.py --video_dir videos/20bn-something-something-v2/ --output_dir frames/
 
-# HYBRID preprocessing  
+# HYBRID preprocessing (GT ROI + MediaPipe)
 python preprocess.py --frames_dir frames/ --annotations annotations.json --output processed_data/
 ```
 
