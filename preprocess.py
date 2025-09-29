@@ -40,70 +40,79 @@ def get_mediapipe_hands():
         _mediapipe_hands = mp_hands.Hands(
             static_image_mode=True,  # Better for individual frame processing
             max_num_hands=1,         # Focus on one hand
-            min_detection_confidence=0.8,  # Higher confidence since we have ROI
-            min_tracking_confidence=0.8
+            min_detection_confidence=0.3,  # Lower confidence for better detection
+            min_tracking_confidence=0.3
         )
-        print("✅ MediaPipe Hands loaded for ROI-guided processing")
+        print("✅ MediaPipe Hands loaded for full-frame processing")
     return _mediapipe_hands
 
-def detect_hand_landmarks_from_roi(frame, hand_bbox):
+def detect_hand_landmarks_full_frame(frame, hand_bbox=None):
     """
-    Extract hand landmarks using MediaPipe on a ground-truth ROI.
+    Extract hand landmarks using MediaPipe on the full frame.
+    If hand_bbox is provided, we can validate the detection is in the right area.
     
     Args:
         frame: Full video frame (BGR format from OpenCV)
-        hand_bbox: Ground truth hand bounding box {'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2}
+        hand_bbox: Optional ground truth hand bounding box for validation
         
     Returns:
-        landmarks: np.array of shape (21, 2) with coordinates in FULL FRAME space, or None
+        landmarks: np.array of shape (21, 2) with coordinates in frame space, or None
     """
     hands_model = get_mediapipe_hands()
     if hands_model is None:
         return None
-        
-    # Extract ROI coordinates
-    x1 = max(0, int(hand_bbox['x1']))
-    y1 = max(0, int(hand_bbox['y1']))
-    x2 = min(frame.shape[1], int(hand_bbox['x2']))
-    y2 = min(frame.shape[0], int(hand_bbox['y2']))
-    
-    # Validate bbox
-    if x1 >= x2 or y1 >= y2:
-        print(f"⚠️  Invalid hand bbox: {hand_bbox}")
-        return None
-    
-    # Crop hand region
-    hand_crop = frame[y1:y2, x1:x2]
     
     # Convert BGR to RGB for MediaPipe
-    rgb_crop = cv2.cvtColor(hand_crop, cv2.COLOR_BGR2RGB)
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     
-    # Process the hand crop
-    results = hands_model.process(rgb_crop)
+    # Process the full frame
+    results = hands_model.process(rgb_frame)
     
     if results.multi_hand_landmarks:
-        # Get the first (most confident) hand
-        hand_landmarks = results.multi_hand_landmarks[0]
+        # Get frame dimensions
+        h, w = frame.shape[:2]
         
-        # Extract landmark coordinates in crop space
-        crop_h, crop_w = hand_crop.shape[:2]
+        # If we have ground truth bbox, find the hand closest to it
+        if hand_bbox:
+            gt_center_x = (hand_bbox['x1'] + hand_bbox['x2']) / 2
+            gt_center_y = (hand_bbox['y1'] + hand_bbox['y2']) / 2
+            
+            best_hand = None
+            min_distance = float('inf')
+            
+            for hand_landmarks in results.multi_hand_landmarks:
+                # Calculate hand center from landmarks
+                hand_center_x = sum(lm.x for lm in hand_landmarks.landmark) / 21 * w
+                hand_center_y = sum(lm.y for lm in hand_landmarks.landmark) / 21 * h
+                
+                # Distance to ground truth center
+                distance = ((hand_center_x - gt_center_x) ** 2 + (hand_center_y - gt_center_y) ** 2) ** 0.5
+                
+                if distance < min_distance:
+                    min_distance = distance
+                    best_hand = hand_landmarks
+            
+            # Use the closest hand if it's reasonably close
+            if best_hand and min_distance < 100:  # Within 100 pixels
+                hand_landmarks = best_hand
+            else:
+                return None  # No hand close to ground truth
+        else:
+            # No ground truth, just use the first detected hand
+            hand_landmarks = results.multi_hand_landmarks[0]
+        
+        # Extract landmark coordinates
         landmarks = []
-        
         for lm in hand_landmarks.landmark:
-            # Convert from normalized coordinates to crop pixel coordinates
-            crop_x = lm.x * crop_w
-            crop_y = lm.y * crop_h
-            
-            # Convert back to full frame coordinates
-            full_frame_x = crop_x + x1
-            full_frame_y = crop_y + y1
-            
-            landmarks.append([full_frame_x, full_frame_y])
+            # Convert from normalized coordinates to pixel coordinates
+            x = lm.x * w
+            y = lm.y * h
+            landmarks.append([x, y])
         
         landmarks = np.array(landmarks, dtype=np.float32)
         return landmarks
     
-    print(f"⚠️  No hand detected in ROI crop")
+    # No hands detected
     return None
 
 def load_annotations(annotation_file):
@@ -153,7 +162,7 @@ def extract_with_hybrid_approach(video_dir, video_id, annotations, output_base_d
         os.makedirs(d, exist_ok=True)
     
     print(f"🎬 Processing video {video_id} with {len(video_annotations)} frames...")
-    print(f"🔬 Using HYBRID approach: Ground Truth ROI → MediaPipe Joints")
+    print(f"🔬 Using IMPROVED approach: MediaPipe Full Frame + Ground Truth Validation")
     
     successful_landmarks = 0
     total_frames = 0
@@ -192,13 +201,10 @@ def extract_with_hybrid_approach(video_dir, video_id, annotations, output_base_d
                 if object_bbox is None:  # Take first non-hand object
                     object_bbox = label['box2d']
         
-        # HYBRID APPROACH: Use ground truth hand bbox as ROI for MediaPipe
-        if hand_bbox:
-            hand_landmarks = detect_hand_landmarks_from_roi(frame, hand_bbox)
-            if hand_landmarks is not None:
-                successful_landmarks += 1
-        else:
-            hand_landmarks = None
+        # IMPROVED APPROACH: MediaPipe on full frame, validate with ground truth
+        hand_landmarks = detect_hand_landmarks_full_frame(frame, hand_bbox)
+        if hand_landmarks is not None:
+            successful_landmarks += 1
         
         # Fallback to dummy landmarks if MediaPipe failed or no hand bbox
         if hand_landmarks is None:
@@ -208,11 +214,14 @@ def extract_with_hybrid_approach(video_dir, video_id, annotations, output_base_d
                 x1, y1, x2, y2 = hand_bbox['x1'], hand_bbox['y1'], hand_bbox['x2'], hand_bbox['y2']
                 center_x, center_y = (x1 + x2) / 2, (y1 + y2) / 2
                 hand_landmarks = np.random.randn(21, 2) * 20 + [center_x, center_y]
-                print(f"⚠️  MediaPipe failed for {frame_name}, using bbox-guided dummy landmarks")
+                # Only show message occasionally to reduce spam
+                if total_frames % 10 == 1:
+                    print(f"⚠️  MediaPipe failed for {frame_name}, using bbox-guided dummy landmarks")
             else:
                 # Complete fallback
                 hand_landmarks = np.random.randn(21, 2) * 20 + [w/2, h/2]
-                print(f"⚠️  No hand annotation for {frame_name}, using center dummy landmarks")
+                if total_frames % 10 == 1:
+                    print(f"⚠️  No hand annotation for {frame_name}, using center dummy landmarks")
         
         # Save hand landmarks
         landmarks_path = os.path.join(hand_landmarks_dir, frame_name.replace('.jpg', '.npy'))
@@ -299,11 +308,11 @@ def process_dataset(video_base_dir, annotation_file, output_base_dir, video_ids=
             print(f"❌ Failed to process video {video_id}: {e}")
             failed += 1
     
-    print(f"\n🎉 HYBRID processing complete!")
+    print(f"\n🎉 IMPROVED processing complete!")
     print(f"   ✅ Successful: {successful} videos")
     print(f"   ❌ Failed: {failed} videos")
-    print(f"   🔬 Approach: Ground Truth Hand ROI + MediaPipe Joints")
-    print(f"   💡 Result: High-quality hand landmarks with spatial guidance")
+    print(f"   🔬 Approach: MediaPipe Full Frame + Ground Truth Validation")
+    print(f"   💡 Result: Natural hand detection with ground truth guidance")
 
 # Legacy function for compatibility
 def extract(video, tmpl='%06d.jpg'):
