@@ -45,10 +45,11 @@ MediaPipe hand detection is **CPU-only** - it doesn't support GPU acceleration. 
 
 ## ⚠️ **Memory Considerations:**
 
-**IMPORTANT**: Each worker loads MediaPipe + annotations into memory!
-- Each worker: ~500MB-1GB RAM
-- 16 workers = ~8-16GB RAM
-- **Start small and increase gradually**
+**OPTIMIZED**: Annotations loaded once, not per worker!
+- Main process: Loads 180K annotations once (~2GB)
+- Each worker: Only MediaPipe model (~200MB)
+- 16 workers = ~2GB (annotations) + 3GB (workers) = ~5GB total
+- **Much more memory efficient now!**
 
 ## 🎯 **Recommended Settings:**
 
