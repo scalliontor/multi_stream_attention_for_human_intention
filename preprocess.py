@@ -302,12 +302,13 @@ def extract_with_hybrid_approach(video_dir, video_id, annotations, output_base_d
 
 def process_single_video(args):
     """Helper function for multiprocessing."""
-    video_base_dir, video_id, annotations, output_base_dir = args
+    video_base_dir, video_id, annotation_file, output_base_dir = args
     try:
+        # Load annotations inside worker to avoid pickling large objects
+        annotations = load_annotations(annotation_file)
         result = extract_with_hybrid_approach(video_base_dir, video_id, annotations, output_base_dir)
         return (True, video_id) if result[0] is not None else (False, video_id)
     except Exception as e:
-        print(f"❌ Failed to process video {video_id}: {e}")
         return (False, video_id)
 
 def process_dataset(video_base_dir, annotation_file, output_base_dir, video_ids=None, num_workers=None):
@@ -328,21 +329,22 @@ def process_dataset(video_base_dir, annotation_file, output_base_dir, video_ids=
         video_ids = list(annotations.keys())
     
     if num_workers is None:
-        num_workers = max(1, cpu_count() - 1)  # Leave 1 CPU free
+        # Conservative default: use fewer workers to avoid memory issues
+        num_workers = min(8, max(1, cpu_count() // 2))  # Use half of CPUs, max 8
     
     print(f"📋 Processing {len(video_ids)} videos with HYBRID approach...")
     print(f"🔬 Method: MediaPipe Full Frame + Smart Object Selection")
     print(f"⚡ Using {num_workers} parallel workers")
     
-    # Prepare arguments for multiprocessing
-    args_list = [(video_base_dir, vid, annotations, output_base_dir) for vid in video_ids]
+    # Prepare arguments for multiprocessing - pass annotation_file path instead of loaded annotations
+    args_list = [(video_base_dir, vid, annotation_file, output_base_dir) for vid in video_ids]
     
     successful = 0
     failed = 0
     
-    # Process videos in parallel
+    # Process videos in parallel with smaller chunks to reduce memory
     with Pool(num_workers) as pool:
-        results = list(tqdm(pool.imap(process_single_video, args_list), total=len(video_ids), desc="Processing videos"))
+        results = list(tqdm(pool.imap(process_single_video, args_list, chunksize=1), total=len(video_ids), desc="Processing videos"))
     
     # Count results
     for success, video_id in results:

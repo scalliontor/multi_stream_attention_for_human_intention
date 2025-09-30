@@ -45,29 +45,48 @@ MediaPipe hand detection is **CPU-only** - it doesn't support GPU acceleration. 
 
 ## ⚠️ **Memory Considerations:**
 
-- Each worker loads its own MediaPipe model (~200MB)
-- 16 workers = ~3GB RAM
-- 32 workers = ~6GB RAM
-- Adjust `--workers` based on your RAM
+**IMPORTANT**: Each worker loads MediaPipe + annotations into memory!
+- Each worker: ~500MB-1GB RAM
+- 16 workers = ~8-16GB RAM
+- **Start small and increase gradually**
 
 ## 🎯 **Recommended Settings:**
 
 ### **High-end server (32+ cores, 64GB+ RAM)**:
 ```bash
-python preprocess.py --workers 32
+# Start with 8, increase if stable
+python preprocess.py --workers 8
+# If stable, try 16
+python preprocess.py --workers 16
 ```
 
 ### **Mid-range server (16 cores, 32GB RAM)**:
 ```bash
-python preprocess.py --workers 16
+# Safe default
+python preprocess.py --workers 8
 ```
 
 ### **Desktop (8 cores, 16GB RAM)**:
 ```bash
-python preprocess.py --workers 8
+# Conservative
+python preprocess.py --workers 4
 ```
 
 ### **Laptop (4 cores, 8GB RAM)**:
 ```bash
-python preprocess.py --workers 4
+# Very conservative
+python preprocess.py --workers 2
+```
+
+## 💡 **Best Practice:**
+
+1. **Start small**: Test with `--workers 4 --max_videos 10`
+2. **Monitor RAM**: Use `htop` or `top` to watch memory usage
+3. **Increase gradually**: If stable, double the workers
+4. **If killed**: Reduce workers by half
+
+### **Safe Test Command**:
+```bash
+# Test with 4 workers on 10 videos
+python preprocess.py --workers 4 --max_videos 10
 ```
