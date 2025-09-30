@@ -23,8 +23,26 @@ class SimpleDataset(Dataset):
         with open(annotation_file, 'r') as f:
             all_annotations = json.load(f)
         
-        available_videos = set(os.listdir(frame_root))
+        # Check for processed videos (format: processed_VIDEO_ID)
+        if os.path.exists(frame_root):
+            available_dirs = set(os.listdir(frame_root))
+            # Extract video IDs from processed_VIDEO_ID format
+            available_videos = set()
+            for dirname in available_dirs:
+                if dirname.startswith('processed_'):
+                    video_id = dirname.replace('processed_', '')
+                    available_videos.add(video_id)
+        else:
+            print(f"⚠️  Data directory not found: {frame_root}")
+            print(f"💡 Run preprocessing first: python preprocess.py")
+            available_videos = set()
+        
         self.annotations = [s for s in all_annotations if s['id'] in available_videos][:max_samples]
+        
+        if len(self.annotations) == 0:
+            print(f"⚠️  No processed videos found in {frame_root}")
+            print(f"📊 Available directories: {len(available_dirs) if os.path.exists(frame_root) else 0}")
+            print(f"💡 Run preprocessing first to create processed data")
         
         # Load labels file - try different locations
         if labels_file is None:
@@ -73,8 +91,14 @@ class SimpleDataset(Dataset):
         if isinstance(class_idx, str):
             class_idx = 0  # Default to class 0 if mapping fails
         
-        # Load context frames (full frames)
-        frame_dir = os.path.join(self.frame_root, video_id)
+        # Load context frames (full frames) from processed directory
+        processed_dir = os.path.join(self.frame_root, f'processed_{video_id}')
+        frame_dir = os.path.join(processed_dir, 'frames')
+        
+        if not os.path.exists(frame_dir):
+            # Fallback to old structure
+            frame_dir = os.path.join(self.frame_root, video_id)
+        
         frame_files = sorted([f for f in os.listdir(frame_dir) if f.endswith('.jpg')])[:30]
         
         context_frames = []
@@ -88,7 +112,7 @@ class SimpleDataset(Dataset):
                 continue
         
         # Load Something-Else annotation-based object crops
-        object_crops_dir = os.path.join(frame_dir, 'object_crops')
+        object_crops_dir = os.path.join(processed_dir, 'object_crops')
         object_crops = []
         
         if os.path.exists(object_crops_dir):
@@ -125,7 +149,7 @@ class SimpleDataset(Dataset):
             object_crops = object_crops[:30]
         
         # Load hand landmarks (derived from Something-Else annotations during preprocessing)
-        hand_landmarks_dir = os.path.join(frame_dir, 'hand_landmarks')
+        hand_landmarks_dir = os.path.join(processed_dir, 'hand_landmarks')
         hand_landmarks_sequence = []
         
         if os.path.exists(hand_landmarks_dir):
