@@ -20,6 +20,7 @@ import json
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
+from multiprocessing import Pool, cpu_count
 
 # MediaPipe import with fallback
 try:
@@ -299,41 +300,55 @@ def extract_with_hybrid_approach(video_dir, video_id, annotations, output_base_d
     
     return frames_dir, hand_landmarks_dir, object_crops_dir
 
-def process_dataset(video_base_dir, annotation_file, output_base_dir, video_ids=None):
+def process_single_video(args):
+    """Helper function for multiprocessing."""
+    video_base_dir, video_id, annotations, output_base_dir = args
+    try:
+        result = extract_with_hybrid_approach(video_base_dir, video_id, annotations, output_base_dir)
+        return (True, video_id) if result[0] is not None else (False, video_id)
+    except Exception as e:
+        print(f"❌ Failed to process video {video_id}: {e}")
+        return (False, video_id)
+
+def process_dataset(video_base_dir, annotation_file, output_base_dir, video_ids=None, num_workers=None):
     """
-    Process multiple videos using HYBRID approach.
+    Process multiple videos using HYBRID approach with multiprocessing.
     
     Args:
-        video_base_dir: Base directory containing video frame folders
-        annotation_file: Path to annotations.json file
-        output_base_dir: Base directory for processed outputs
-        video_ids: List of video IDs to process (None = process all)
+        video_base_dir: Directory containing video frames
+        annotation_file: Path to Something-Else annotations JSON
+        output_base_dir: Directory to save processed data
+        video_ids: List of video IDs to process (if None, process all)
+        num_workers: Number of parallel workers (default: CPU count)
     """
     # Load annotations
     annotations = load_annotations(annotation_file)
     
-    # Get video IDs to process
     if video_ids is None:
         video_ids = list(annotations.keys())
     
+    if num_workers is None:
+        num_workers = max(1, cpu_count() - 1)  # Leave 1 CPU free
+    
     print(f"📋 Processing {len(video_ids)} videos with HYBRID approach...")
-    print(f"🔬 Method: Ground Truth ROI → MediaPipe Joints → Rich Hand Information")
+    print(f"🔬 Method: MediaPipe Full Frame + Smart Object Selection")
+    print(f"⚡ Using {num_workers} parallel workers")
+    
+    # Prepare arguments for multiprocessing
+    args_list = [(video_base_dir, vid, annotations, output_base_dir) for vid in video_ids]
     
     successful = 0
     failed = 0
-    total_landmarks_success = 0
-    total_frames_processed = 0
     
-    for video_id in video_ids:
-        try:
-            result = extract_with_hybrid_approach(video_base_dir, video_id, annotations, output_base_dir)
-            if result[0] is not None:
-                successful += 1
-                # Count successful landmark extractions (would need to modify function to return this)
-            else:
-                failed += 1
-        except Exception as e:
-            print(f"❌ Failed to process video {video_id}: {e}")
+    # Process videos in parallel
+    with Pool(num_workers) as pool:
+        results = list(tqdm(pool.imap(process_single_video, args_list), total=len(video_ids), desc="Processing videos"))
+    
+    # Count results
+    for success, video_id in results:
+        if success:
+            successful += 1
+        else:
             failed += 1
     
     print(f"\n🎉 IMPROVED processing complete!")
@@ -360,6 +375,7 @@ if __name__ == "__main__":
     parser.add_argument('--annotations', default='annotations.json', help='Merged annotations file')
     parser.add_argument('--output', default='processed_data', help='Output directory')
     parser.add_argument('--max_videos', type=int, default=None, help='Limit number of videos (for testing)')
+    parser.add_argument('--workers', type=int, default=None, help='Number of parallel workers (default: CPU count - 1)')
     
     args = parser.parse_args()
     
@@ -381,7 +397,7 @@ if __name__ == "__main__":
             else:
                 print(f"📊 Processing {len(video_ids)} videos")
             
-            process_dataset(args.frames_dir, args.annotations, args.output, video_ids)
+            process_dataset(args.frames_dir, args.annotations, args.output, video_ids, args.workers)
             print("✅ HYBRID preprocessing completed successfully!")
         except Exception as e:
             print(f"❌ Processing failed: {e}")

@@ -189,12 +189,12 @@ def train():
     print(f"Epochs: {NUM_EPOCHS}")
     print()
     
-    # Create datasets
-    train_dataset = SimpleDataset('20bn-something-something-v2-frames', 
-                                 'annotations/something-something-v2-train.json', 
+    # Create datasets - use processed_data directory
+    train_dataset = SimpleDataset('processed_data', 
+                                 'something-something-v2-train.json', 
                                  max_samples=MAX_TRAIN_SAMPLES)
-    val_dataset = SimpleDataset('20bn-something-something-v2-frames', 
-                               'annotations/something-something-v2-validation.json', 
+    val_dataset = SimpleDataset('processed_data', 
+                               'something-something-v2-validation.json', 
                                max_samples=MAX_VAL_SAMPLES)
     
     train_loader = DataLoader(train_dataset, 
